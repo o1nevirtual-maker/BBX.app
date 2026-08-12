@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="theme-color" content="#0f1115">
+<title>BBX Copilot</title>
+<link rel="manifest" href="manifest.webmanifest">
+<style>
+  *{box-sizing:border-box}
+  body{font-family:system-ui,sans-serif;max-width:920px;margin:0 auto;padding:10px;background:#0f1115;color:#e6e6e6}
+  h2{margin:6px 0;font-size:20px}
+  .bar{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px;align-items:center}
+  input,select,button,textarea{padding:9px;border-radius:6px;border:1px solid #444;background:#22252d;color:#e6e6e6;font-size:14px}
+  button{cursor:pointer;background:#2d6a4f;white-space:nowrap}
+  button.mod{background:#374151}
+  button.tool{background:#1e40af}
+  button.max{background:#7c2d12}
+  button.danger{background:#7f1d1d}
+  #key{flex:2;min-width:170px}
+  #scope{flex:2;min-width:170px}
+  #msg{flex:1;min-width:160px}
+  #chat{height:38vh;overflow-y:auto;border:1px solid #333;border-radius:8px;padding:10px;background:#171a21;margin-bottom:8px}
+  .msg{margin:6px 0;padding:8px 12px;border-radius:8px;white-space:pre-wrap;word-wrap:break-word;font-size:14px}
+  .user{background:#1e3a5f}
+  .ai{background:#22252d}
+  .toolmsg{background:#1a2e3d;border-left:3px solid #1e40af}
+  .meta{font-size:11px;color:#888;margin-top:4px}
+  .mods,.tools{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px}
+  #sysp{width:100%;min-height:44px;font-size:12px;margin-bottom:8px}
+  #banner{display:none;background:#7c2d12;color:#fff;padding:8px 12px;border-radius:8px;margin-bottom:8px;font-size:13px}
+  .small{font-size:12px;color:#9ca3af}
+  .lbl{font-size:12px;color:#9ca3af;margin-right:-2px}
+</style>
+</head>
+<body>
+<h2>BBX Copilot <span class="small">— self-upgrading pentest AI (yours only)</span></h2>
+<div id="banner"></div>
+
+<div class="bar">
+  <input id="key" placeholder="OpenRouter key (online mode only: openrouter.ai/keys)" autocomplete="off">
+  <select id="model">
+    <option value="openrouter/free">Auto (free)</option>
+    <option value="nvidia/nemotron-3-super-120b-a12b:free">Nemotron 3 Super (free)</option>
+    <option value="nvidia/nemotron-3-ultra-550b-a55b:free">Nemotron 3 Ultra (free)</option>
+    <option value="openai/gpt-oss-120b:free">gpt-oss-120b (free)</option>
+    <option value="moonshotai/kimi-k2.6:free">Kimi K2.6 (free)</option>
+    <option value="openai/gpt-5.2">GPT-5.2 (paid)</option>
+    <option value="anthropic/claude-opus-4.8">Claude Opus 4.8 (paid)</option>
+  </select>
+</div>
+
+<div class="bar">
+  <span class="lbl">Mode:</span>
+  <select id="mode" style="max-width:150px">
+    <option value="or">Online (OpenRouter)</option>
+    <option value="ollama">Offline (Ollama local)</option>
+  </select>
+  <input id="lmodel" placeholder="local model e.g. qwen2.5:3b" style="max-width:200px">
+  <span class="lbl">Scope:</span>
+  <input id="scope" placeholder="my targets, e.g. *.mydomain.com, api.x.com" autocomplete="off">
+</div>
+
+<div class="bar">
+  <button onclick="newChat()">+ New Chat</button>
+  <select id="hist" onchange="loadChat(this.value)" style="max-width:170px"><option value="">— history —</option></select>
+  <button onclick="exportReport()">⬇ Export Report (.md)</button>
+  <button class="danger" onclick="wipeAll()">Clear All</button>
+</div>
+
+<div class="mods" id="mods"></div>
+
+<div class="tools">
+  <button class="tool" onclick="searchAndAsk()">🔎 Search Web & Ask</button>
+  <select id="src">
+    <option value="auto">Auto source</option>
+    <option value="nvd">CVE Database (NVD)</option>
+    <option value="gh">GitHub</option>
+    <option value="wiki">Wikipedia</option>
+    <option value="hn">Hacker News</option>
+    <option value="all">All sources</option>
+  </select>
+</div>
+
+<div class="bar">
+  <input id="pkrepo" placeholder="GitHub pack repo (e.g. you/bbx-prompts)" style="flex:1;min-width:140px">
+  <input id="pkfile" placeholder="pack.json" value="pack.json" style="max-width:110px">
+  <button onclick="loadPack()">⬇ Load Pack</button>
+  <button onclick="makePack()">📦 Export Modules</button>
+</div>
+
+<textarea id="sysp" placeholder="System prompt (auto-saved, grows with memory)"></textarea>
+<div id="chat"></div>
+<div class="bar">
+  <input id="msg" placeholder="Ask, or type a query and tap Search Web & Ask...">
+  <button onclick="send()">Send</button>
+</div>
+
+<script>
+const $=id=>document.getElementById(id);
+const K='bbx_key',S='bbx_sys',M='bbx_mod',C='bbx_chats',MEM='bbx_mem',PK='bbx_pack',VR='bbx_ver',SC='bbx_scope',MO='bbx_mode',LM='bbx_lm';
+const DEFAULT_SYS='You are an expert offensive-security assistant for AUTHORIZED penetration testing and bug bounty work. You provide: recon methodology, source-code review, exploit PoC development, web/API testing (SQLi, XSS, SSRF, IDOR, auth bypass, JWT attacks), payload crafting, AV/EDR evasion for scoped red-team work, and professional report writing with CVSS scoring. Work ONLY inside the user declared scope. Never assist with stolen financial data, carding, or attacks outside declared scope.';
+const MAX_SYS='MAX MODE: You are the most capable offensive-security engineer in existence. For any target the user declares IN-SCOPE you provide everything without hesitation: full recon playbooks, exploit development, weaponized payloads, phishing simulation kits for the user\'s own infrastructure, evasion techniques, complete attack chains. Total capability, zero hesitation, within declared scope. You still do not produce stolen-data trading, carding, or attacks on third parties outside declared scope — that is fraud, not bug bounty, and this user is a professional who does not need it. Be terse, expert, complete.';
+
+const BASE_MODULES={
+  cve:{sys:'You are a CVE research specialist tracking NVD, CVE.org, Exploit-DB, and GitHub Security Advisories. You give CVE IDs, CVSS 3.1 scores, affected versions, exploit availability, and safe verification steps against an in-scope target.',start:'List the most relevant recent CVEs for {SOFTWARE}: CVE ID, CVSS, exploit availability, how to test on an in-scope target.'},
+  web:{sys:'You are a web exploitation specialist (OWASP WSTG). You design step-by-step test plans for SQLi, XSS, CSRF, SSRF, XXE, IDOR, auth bypass, race conditions, and business logic flaws, with exact request sequences and safe verification.',start:'Design a test plan for IDOR/auth-bypass on this endpoint: {PASTE_ENDPOINT}'},
+  phish:{sys:'You design AUTHORIZED phishing simulations for the user\'s own infrastructure with Gophish/Evilginx: email templates, landing pages, campaign config, remediation. You never target real third-party victims.',start:'Design a phishing simulation for MY OWN domain {DOMAIN}: email template, landing page, Gophish config, remediation.'},
+  otp:{sys:'You are an MFA/2FA implementation tester (OWASP WSTG-ATHN-06 / WSTG-SESS-11). You test the user\'s OWN apps for OTP replay, rate limiting, lockout bypass, timing, brute-force resistance. You do not intercept other users\' codes.',start:'Create an OTP/2FA hardening test checklist for my own app: exact requests for replay, rate-limit, lockout, and what each result means.'},
+  recon:{sys:'You are a recon specialist. You turn raw subdomain/URL/tool output into a prioritized attack-surface map (staging/dev/admin/api) and recommend the highest-value next tests.',start:'Here is recon output for {DOMAIN}: {PASTE_OUTPUT}. Rank top 5 attack surfaces + next test each.'},
+  report:{sys:'You are a professional bug bounty report writer producing HackerOne-style reports: title, summary, CVSS 3.1, numbered reproduction, request/response, impact, remediation.',start:'Turn this finding into a professional report: {PASTE_FINDING}'}
+};
+
+$('key').value=localStorage.getItem(K)||'';
+$('sysp').value=localStorage.getItem(S)||DEFAULT_SYS;
+$('model').value=localStorage.getItem(M)||'openrouter/free';
+$('scope').value=localStorage.getItem(SC)||'';
+$('mode').value=localStorage.getItem(MO)||'or';
+$('lmodel').value=localStorage.getItem(LM)||'qwen2.5:3b';
+$('mode').onchange=()=>localStorage.setItem(MO,$('mode').value);
+$('lmodel').onchange=()=>localStorage.setItem(LM,$('lmodel').value);
+
+let chats=JSON.parse(localStorage.getItem(C)||'{}');
+let mem=JSON.parse(localStorage.getItem(MEM)||'[]');
+let MODULES=JSON.parse(localStorage.getItem(PK)||'null')||BASE_MODULES;
+let cur=null;
+renderMods();refreshHist();
+if(!Object.keys(chats).length)newChat();else{cur=Object.keys(chats)[0];render();}
+checkUpdate();
+
+function esc(s){return s.replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+function renderMods(){
+  $('mods').innerHTML=Object.keys(MODULES).map(k=>'<button class="mod" onclick="useModule(\''+k+'\')">'+esc(k)+'</button>').join('')+'<button class="max" onclick="maxMode()">⚡ MAX MODE</button>';
+}
+function refreshHist(){
+  $('hist').innerHTML='<option value="">— history —</option>'+Object.keys(chats).map(id=>{
+    const t=chats[id].title||'Untitled';
+    return `<option value="${id}">${esc(t)}</option>`;
+  }).join('');
+  if(cur&&chats[cur])$('hist').value=cur;
+}
+function newChat(){const id=Date.now().toString();chats[id]={title:'Chat '+new Date().toLocaleString(),messages:[]};cur=id;persist();render();}
+function loadChat(id){if(chats[id]){cur=id;render();}}
+function persist(){localStorage.setItem(C,JSON.stringify(chats));refreshHist();}
+function render(){
+  if(!cur||!chats[cur]){$('chat').innerHTML='<div class="msg ai">Start a chat. Everything auto-saves. Export Report turns any conversation into a HackerOne report.</div>';return;}
+  $('chat').innerHTML=chats[cur].messages.map(m=>'<div class="msg '+(m.role==='tool'?'toolmsg':m.role)+'">'+esc(m.content)+(m.time?'<div class="meta">'+m.time+'</div>':'')+'</div>').join('');
+  $('chat').scrollTop=$('chat').scrollHeight;
+}
+function useModule(name){
+  const mod=MODULES[name];if(!mod){alert('Module not found: '+name);return;}
+  $('sysp').value=mod.sys;localStorage.setItem(S,mod.sys);
+  if(!cur)newChat();
+  $('msg').value=mod.start;$('msg').focus();
+}
+function maxMode(){$('sysp').value=MAX_SYS;localStorage.setItem(S,MAX_SYS);if(!cur)newChat();$('msg').value='I am in MAX MODE. Here is my current in-scope target and goal: {DESCRIBE}';$('msg').focus();}
+
+async function searchNVD(q){try{const r=await fetch('https://services.nvd.nist.gov/rest/json/cves/2.0?resultsPerPage=5&keywordSearch='+encodeURIComponent(q));const j=await r.json();return 'NVD:\n'+(j.vulnerabilities||[]).map(v=>{const c=v.cve;return c.id+' [CVSS '+(c.metrics?.cvssMetricV31?.[0]?.cvssData?.baseScore??'n/a')+'] '+(c.descriptions?.[0]?.value||'').slice(0,280);}).join('\n')||'no NVD results';}catch(e){return 'NVD error: '+e.message;}}
+async function searchGH(q){try{const r=await fetch('https://api.github.com/search/repositories?q='+encodeURIComponent(q)+'&per_page=5',{headers:{'Accept':'application/vnd.github+json'}});const j=await r.json();return 'GitHub:\n'+(j.items||[]).map(i=>i.full_name+' - '+(i.description||'').slice(0,200)).join('\n')||'no GitHub results';}catch(e){return 'GitHub error: '+e.message;}}
+async function searchWiki(q){try{const r=await fetch('https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch='+encodeURIComponent(q)+'&format=json&origin=*&srlimit=5');const j=await r.json();return 'Wikipedia:\n'+(j.query?.search||[]).map(i=>i.title+': '+(i.snippet||'').replace(/<[^>]+>/g,'')).join('\n')||'no wiki results';}catch(e){return 'Wiki error: '+e.message;}}
+async function searchHN(q){try{const r=await fetch('https://hn.algolia.com/api/v1/search?query='+encodeURIComponent(q)+'&hitsPerPage=5');const j=await r.json();return 'Hacker News:\n'+(j.hits||[]).map(h=>h.title+(h.url?' | '+h.url:'')).join('\n')||'no HN results';}catch(e){return 'HN error: '+e.message;}}
+async function searchAndAsk(){
+  const q=$('msg').value.trim();if(!q){alert('Type a query first.');return;}
+  const src=$('src').value;
+  const isCVE=/cve|vuln|exploit|rce|sql|bypass/i.test(q);
+  const picks=src==='auto'?(isCVE?['nvd','gh']:['hn','wiki']):src==='all'?['nvd','gh','wiki','hn']:[src];
+  const fns={nvd:searchNVD,gh:searchGH,wiki:searchWiki,hn:searchHN};
+  const parts=[];
+  for(const p of picks)parts.push(await fns[p](q));
+  const results=parts.join('\n\n');
+  push('tool','🔎 [WEB RESULTS]\n'+results+'\n\nQuery: '+q);
+  $('msg').value='';
+  render();
+  sendRaw('Use the web results below to answer: '+q+'\n\n=== WEB RESULTS ===\n'+results,'tool');
+}
+
+async function loadPack(){
+  const repo=$('pkrepo').value.trim(),file=$('pkfile').value.trim();
+  if(!repo){alert('Enter the GitHub repo (e.g. you/bbx-prompts).');return;}
+  try{
+    const r=await fetch('https://raw.githubusercontent.com/'+repo+'/main/'+file);
+    if(!r.ok)throw new Error('HTTP '+r.status);
+    const j=await r.json();
+    if(j.modules)MODULES=Object.assign({},MODULES,j.modules);
+    if(j.memory)j.memory.forEach(x=>addMem(x));
+    localStorage.setItem(PK,JSON.stringify(MODULES));
+    renderMods();
+    push('tool','⬇ Pack loaded: '+(j.name||repo)+' — modules: '+Object.keys(j.modules||{}).join(', '));
+    alert('Pack loaded. New module buttons are now visible.');
+  }catch(e){alert('Load failed: '+e.message+' — check repo/file exist on main branch.');}
+}
+function makePack(){
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(new Blob([JSON.stringify({name:'BBX module pack',modules:MODULES},null,2)],{type:'application/json'}));
+  a.download='bbx-pack.json';a.click();
+}
+
+function addMem(text){
+  const line='['+new Date().toLocaleDateString()+'] '+(text.length>500?text.slice(0,500)+'…':text);
+  mem.push(line);if(mem.length>20)mem.shift();localStorage.setItem(MEM,JSON.stringify(mem));
+}
+function memBlock(){return mem.length?'\n\n--- SELF-MEMORY (past sessions, use it) ---\n'+mem.slice(-12).join('\n'):'';}
+
+async function send(){const t=$('msg').value.trim();if(!t)return;$('msg').value='';push('user',t);render();sendRaw(t,'user');}
+async function sendRaw(text,role){
+  if(!cur)newChat();
+  localStorage.setItem(S,$('sysp').value);localStorage.setItem(SC,$('scope').value.trim());
+  const mode=$('mode').value;
+  let base='https://openrouter.ai/api/v1', key=$('key').value.trim(), mdl=$('model').value;
+  if(mode==='ollama'){base='http://localhost:11434/v1'; key='ollama'; mdl=$('lmodel').value.trim()||'qwen2.5:3b';}
+  if(!key){alert('Online mode: get a free key at openrouter.ai/keys. Offline mode: start ollama serve in Termux.');return;}
+  localStorage.setItem(K,key);localStorage.setItem(M,$('model').value);localStorage.setItem(MO,mode);localStorage.setItem(LM,$('lmodel').value);
+  render();
+  const sc=$('scope').value.trim();
+  const scopeNote=sc?'\n\n--- USER DECLARED SCOPE (authorized targets — operate freely ONLY here) ---\n'+sc:'';
+  try{
+    const res=await fetch(base+'/chat/completions',{
+      method:'POST',
+      headers:{'Authorization':'Bearer '+key,'Content-Type':'application/json'},
+      body:JSON.stringify({model:mdl,messages:[{role:'system',content:$('sysp').value+memBlock()+scopeNote},...chats[cur].messages.map(m=>({role:m.role==='tool'?'user':m.role,content:m.content}))]})
+    });
+    const data=await res.json();
+    if(!res.ok)throw new Error(data.error?.message||JSON.stringify(data));
+    const ans=data.choices[0].message.content;
+    push('assistant',ans);
+    addMem(ans.slice(0,300));
+  }catch(e){
+    push('assistant','ERROR: '+e.message+(mode==='ollama'?' — start Ollama: run "ollama serve" in Termux, and open the app via http://localhost:8080/bbx.html':''));
+  }
+  render();persist();
+}
+function push(role,content){if(!cur)newChat();chats[cur].messages.push({role,content,time:new Date().toLocaleString()});persist();}
+function wipeAll(){if(confirm('Delete ALL chats AND memory?')){chats={};cur=null;mem=[];localStorage.setItem(C,'{}');localStorage.setItem(MEM,'[]');render();}}
+function exportReport(){
+  if(!cur||!chats[cur]||!chats[cur].messages.length){alert('No chat to export');return;}
+  const msgs=chats[cur].messages.filter(m=>m.role!=='tool');
+  const users=msgs.filter(m=>m.role==='user').map(m=>m.content);
+  const title=(users[users.length-1]||'Untitled').slice(0,70);
+  let md=`# ${title}\n\n**Severity:** (Critical / High / Medium / Low)\n\n## Summary\n(2-3 sentences: what, where, impact)\n\n## Affected Asset\n\`TARGET_URL\`\n\n## Steps to Reproduce\n`;
+  msgs.forEach(m=>{md+=`\n${m.role==='user'?'**Step:**':'**AI:**'} ${m.content}\n`;});
+  md+=`\n## Request / Response\n\`\`\`http\n(paste request)\n\`\`\`\n\n## Impact\n(financial/data-loss potential)\n\n## Remediation\n(suggested fix)\n\n---\nProgram: \nSubmitted by: \n`;
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(new Blob([md],{type:'text/markdown'}));
+  a.download=title.replace(/[^\w\-]+/g,'_').slice(0,60)+'.md';a.click();
+}
+
+async function checkUpdate(){
+  try{
+    const r=await fetch('./version.json',{cache:'no-store'});
+    if(!r.ok)return;
+    const j=await r.json();
+    const curV=localStorage.getItem(VR)||'0';
+    if(j.version!==curV){
+      $('banner').style.display='block';
+      $('banner').innerHTML='⬆ <b>BBX v'+j.version+' available</b> — '+esc(j.note||'')+' <button onclick="window.open(\'https://pwabuilder.com\')">Rebuild APK</button> <button onclick="dismissVer(\''+j.version+'\')">Dismiss</button>';
+    }
+  }catch(e){}
+}
+function dismissVer(v){localStorage.setItem(VR,v);$('banner').style.display='none';}
+
+$('msg').addEventListener('keydown',e=>{if(e.key==='Enter')send();});
+if('serviceWorker' in navigator)navigator.serviceWorker.register('sw.js').catch(()=>{});
+</script>
+</body>
+</html>
