@@ -4,8 +4,9 @@ BBX Security Workbench - local server (static files + REST API)
 ================================================================
 Serves bbx.html and the pages/ directory, plus a JSON API for
 threat-intel lookups (NVD), LLM report synthesis (OpenAI), test-payload
-generation, a learning log, page management, self-update, and an
-authenticated command shell for local tooling.
+generation, infrastructure status, a master-sweep ("override") endpoint,
+a learning log, page management, self-update, and an authenticated
+command shell for local tooling.
 
 Endpoints
 ---------
@@ -20,13 +21,19 @@ POST   /api/cmd                    run a local shell command (auth required)
 GET    /api/cve/<CVE-ID>           NVD 2.0 vulnerability lookup
 POST   /api/analyze                LLM threat-intel synthesis (OpenAI JSON mode)
 POST   /api/payload                generate PoC payloads (xss|sqli|ssti)
+POST   /api/override               master sweep: CVE intel + payloads + infra + LLM
 
 Configuration (environment variables)
 -------------------------------------
-BBX_OPENAI_API_KEY   required for /api/analyze
+BBX_OPENAI_API_KEY   required for /api/analyze and /api/override (LLM step)
 BBX_LLM_MODEL        default: gpt-4o
 BBX_NVD_API_KEY      optional NVD 2.0 key (raises limit from 5 to 50 req/30s)
 BBX_API_TOKEN        bearer token required for /api/cmd (strongly advised with --lan)
+BBX_PROXIES          optional comma-separated proxy list (scheme://user:pass@host:port)
+BBX_SMTP_HOST        optional SMTP relay host (identity/infra reporting)
+BBX_SMTP_PORT        default 587
+BBX_SMTP_USER        optional SMTP user
+BBX_SMTP_FROM        optional sender address
 BBX_HOST / BBX_PORT  default 127.0.0.1:8080
 
 Usage
@@ -43,7 +50,7 @@ import subprocess
 import sys
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional
 from urllib.parse import parse_qs, urlparse
@@ -63,6 +70,11 @@ OPENAI_API_KEY = os.environ.get("BBX_OPENAI_API_KEY", "").strip()
 LLM_MODEL = os.environ.get("BBX_LLM_MODEL", "gpt-4o").strip()
 NVD_API_KEY = os.environ.get("BBX_NVD_API_KEY", "").strip()
 API_TOKEN = os.environ.get("BBX_API_TOKEN", "").strip()
+PROXIES_RAW = os.environ.get("BBX_PROXIES", "").strip()
+SMTP_HOST = os.environ.get("BBX_SMTP_HOST", "").strip()
+SMTP_PORT = int(os.environ.get("BBX_SMTP_PORT", "587") or "587")
+SMTP_USER = os.environ.get("BBX_SMTP_USER", "").strip()
+SMTP_FROM = os.environ.get("BBX_SMTP_FROM", "").strip()
 
 HOST = os.environ.get("BBX_HOST", "0.0.0.0" if ALLOW_LAN else "127.0.0.1")
 PORT = int(os.environ.get("BBX_PORT", "8080"))
@@ -71,6 +83,7 @@ MAX_BODY_BYTES = 1024 * 1024      # 1 MiB request body cap
 CMD_TIMEOUT_SECONDS = 180
 RATE_LIMIT = 6                    # /api/cmd calls per window per client
 RATE_WINDOW_SECONDS = 60.0
+OVERRIDE_RATE_LIMIT = 3           # /api/override calls per window per client
 
 logging.basicConfig(
     level=logging.INFO,
@@ -101,21 +114,39 @@ class RateLimiter:
             return True
 
 
+def mask_proxy(proxy: str) -> str:
+    """Redact credentials from a proxy URL before logging/reporting."""
+    try:
+        parsed = urlparse(proxy)
+        if parsed.username:
+            return f"{parsed.scheme}://***:***@{parsed.hostname}:{parsed.port or ''}"
+    except Exception:
+        pass
+    return proxy
+
+
 # ------------------------------------------------------------ CVE module --
 class CVEModule:
     """Client for the NVD 2.0 REST API (https://services.nvd.nist.gov)."""
 
     BASE_URL = "https://services.nvd.nist.gov/rest/json/cves/2.0"
     CVE_ID_RE = re.compile(r"^CVE-\d{4}-\d{4,}$", re.IGNORECASE)
+    LATEST_DAYS = 30               # window for the "latest" sweep query
+    LATEST_CACHE_TTL = 600.0       # seconds; avoids burning the NVD rate limit
 
     def __init__(self, api_key: str = ""):
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": "BBX-Security-Workbench/1.0"})
         if api_key:
             self.session.headers["apiKey"] = api_key
+        self._latest_cache: Dict[str, Any] = {"ts": 0.0, "data": None}
 
     def query(self, cve_id: str) -> Dict[str, Any]:
+        """Look up a single CVE. Also accepts the alias
+        'latest_common_vulnerability' -> returns the most recent CVEs."""
         cve_id = (cve_id or "").strip().upper()
+        if cve_id == "LATEST_COMMON_VULNERABILITY":
+            return self.latest()
         if not self.CVE_ID_RE.match(cve_id):
             return {"error": "INVALID_CVE_ID",
                     "details": "Expected CVE-YYYY-NNNN (e.g. CVE-2021-44228)"}
@@ -139,6 +170,36 @@ class CVEModule:
         if not vulns:
             return {"error": "NOT_FOUND", "details": f"No record for {cve_id}"}
         return self._summarize(vulns[0]["cve"])
+
+    def latest(self, limit: int = 5) -> Dict[str, Any]:
+        """Most recently published CVEs (cached for 10 minutes)."""
+        now = time.time()
+        if self._latest_cache["data"] is not None and \
+                now - self._latest_cache["ts"] < self.LATEST_CACHE_TTL:
+            return self._latest_cache["data"]
+
+        end = datetime.utcnow()
+        start = end - timedelta(days=self.LATEST_DAYS)
+        params = {
+            "resultsPerPage": max(1, min(limit, 20)),
+            # NVD 2.0 requires millisecond precision; omitted offset = UTC
+            "pubStartDate": start.strftime("%Y-%m-%dT%H:%M:%S.000"),
+            "pubEndDate": end.strftime("%Y-%m-%dT%H:%M:%S.000"),
+        }
+        try:
+            resp = self.session.get(self.BASE_URL, params=params, timeout=20)
+        except requests.RequestException as exc:
+            return {"error": "API_FAILURE", "details": str(exc)}
+        if resp.status_code != 200:
+            return {"error": "HTTP_%d" % resp.status_code,
+                    "details": resp.text[:500]}
+
+        vulns = resp.json().get("vulnerabilities", [])
+        result = {"count": len(vulns),
+                  "window_days": self.LATEST_DAYS,
+                  "items": [self._summarize(v["cve"]) for v in vulns]}
+        self._latest_cache = {"ts": now, "data": result}
+        return result
 
     @staticmethod
     def _summarize(cve: Dict[str, Any]) -> Dict[str, Any]:
@@ -253,11 +314,84 @@ class PayloadModule:
         return {"type": vuln_type, "count": len(payloads), "payloads": payloads}
 
 
+# ------------------------------------------------------- proxy module ------
+class ProxyManager:
+    """Round-robin proxy pool parsed from BBX_PROXIES.
+
+    Credentials are never echoed back in reports; use .status() which
+    masks them. The pool is informational/config-level: downstream tooling
+    (curl in the terminal, recon scripts) can read proxies from the env.
+    """
+
+    def __init__(self, raw: str = ""):
+        self.pool = [p.strip() for p in raw.split(",") if p.strip()]
+        self._idx = 0
+        self._lock = threading.Lock()
+
+    def configured(self) -> bool:
+        return bool(self.pool)
+
+    def next(self) -> Optional[str]:
+        """Return the next proxy (consuming rotation), or None if unset."""
+        if not self.pool:
+            return None
+        with self._lock:
+            proxy = self.pool[self._idx % len(self.pool)]
+            self._idx += 1
+            return proxy
+
+    def current(self) -> Optional[str]:
+        with self._lock:
+            return self.pool[self._idx % len(self.pool)] if self.pool else None
+
+    def status(self) -> Dict[str, Any]:
+        return {
+            "configured": self.configured(),
+            "count": len(self.pool),
+            "current": mask_proxy(self.current()) if self.current() else None,
+        }
+
+
+# ---------------------------------------------------- identity module -----
+class IdentityManager:
+    """Reports optional SMTP relay / sender identity config (BBX_SMTP_*).
+
+    Pure configuration reporting — this module never sends mail.
+    An smtplib sender can be added later without changing the contract.
+    """
+
+    def __init__(self, host: str, port: int, user: str, from_addr: str):
+        self.host = host
+        self.port = port
+        self.user = user
+        self.from_addr = from_addr
+
+    def smtp_configured(self) -> bool:
+        return bool(self.host and self.from_addr)
+
+    def license_details(self, tier: str = "full") -> Dict[str, Any]:
+        configured = self.smtp_configured()
+        return {
+            "tier": tier,
+            "SMTPs": 1 if configured else 0,          # legacy key kept for compat
+            "smtp": {
+                "configured": configured,
+                "host": self.host or None,
+                "port": self.port,
+                "user": self.user or None,
+                "from": self.from_addr or None,
+            },
+        }
+
+
 # ---------------------------------------------------- module singletons ---
 CVE_DB = CVEModule(NVD_API_KEY)
 LLM = LLMModule(OPENAI_API_KEY, LLM_MODEL)
 PAYLOADS = PayloadModule()
+PROXY_MANAGER = ProxyManager(PROXIES_RAW)
+IDENTITY = IdentityManager(SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_FROM)
 CMD_LIMITER = RateLimiter(RATE_LIMIT, RATE_WINDOW_SECONDS)
+OVERRIDE_LIMITER = RateLimiter(OVERRIDE_RATE_LIMIT, RATE_WINDOW_SECONDS)
 
 
 # --------------------------------------------------------------- server ---
@@ -305,6 +439,48 @@ class Handler(SimpleHTTPRequestHandler):
         except Exception:
             return "?"
 
+    # ---- master sweep (the merged force_override_all_systems) ------------
+    def _run_override(self, body: Dict[str, Any]) -> Dict[str, Any]:
+        """Aggregate all subsystems: CVE intel -> payloads -> infra -> LLM."""
+        started = time.monotonic()
+
+        # 1. Immediate data injection (latest CVE intel, NVD-backed, cached)
+        cve_result = CVE_DB.query("latest_common_vulnerability")
+
+        # 2. Payload generation (action layer)
+        payload_result = PAYLOADS.generate(
+            (body.get("payload_type") or "xss").lower().strip(),
+            body.get("payload_context"))
+
+        # 3. Infrastructure check (proxy pool + identity/SMTP config)
+        infra_result = {
+            "proxy": PROXY_MANAGER.status(),
+            "identity": IDENTITY.license_details("full"),
+        }
+
+        # 4. Master synthesis (optional — requires a target URL + LLM key)
+        target = (body.get("target_url") or "").strip()
+        llm_result = None
+        if target:
+            cve_findings = [cve_result] if "error" not in cve_result else []
+            llm_result = LLM.analyze(
+                target, cve_findings, (body.get("manual_notes") or "").strip())
+
+        elapsed = round(time.monotonic() - started, 2)
+        return {
+            "OVERRIDE_STATUS": "all subsystems operational",
+            "DETAIL": "CVE intel, payload engine, proxy pool and identity "
+                      "config queried; optional LLM synthesis ran when a "
+                      "target_url was supplied.",
+            "steps": {
+                "cve_intel": cve_result,
+                "payloads": payload_result,
+                "infra": infra_result,
+                "llm_synthesis": llm_result,
+            },
+            "elapsed_seconds": elapsed,
+        }
+
     # ---- CORS -------------------------------------------------------------
     def do_OPTIONS(self):
         self.send_response(204)
@@ -337,10 +513,13 @@ class Handler(SimpleHTTPRequestHandler):
                     "cve": "ok",
                     "llm": "ready" if LLM.ready() else "not_configured",
                     "payloads": "ok",
+                    "proxy": "ready" if PROXY_MANAGER.configured() else "not_configured",
+                    "smtp": "ready" if IDENTITY.smtp_configured() else "not_configured",
                 },
                 "security": {
                     "cmd_auth_required": bool(API_TOKEN),
                     "cmd_rate_limit": f"{RATE_LIMIT}/{int(RATE_WINDOW_SECONDS)}s",
+                    "override_rate_limit": f"{OVERRIDE_RATE_LIMIT}/{int(RATE_WINDOW_SECONDS)}s",
                 },
             })
             return True
@@ -409,6 +588,16 @@ class Handler(SimpleHTTPRequestHandler):
                            408)
             except OSError as exc:
                 self._json({"error": str(exc)}, 500)
+            return
+
+        if path == "/api/override":
+            if not OVERRIDE_LIMITER.allow(self.client_address[0]):
+                self._json({"error": "RATE_LIMITED",
+                            "details": f"too many /api/override calls "
+                                       f"({OVERRIDE_RATE_LIMIT}/{int(RATE_WINDOW_SECONDS)}s)"},
+                           429)
+                return
+            self._json(self._run_override(body))
             return
 
         if path == "/api/save_page":
@@ -499,9 +688,11 @@ def main() -> int:
     log.info("BBX Security Workbench -> http://%s:%d/bbx.html", HOST, PORT)
     log.info("LAN mode: %s | /api/cmd auth: %s",
              ALLOW_LAN, "required" if API_TOKEN else "disabled")
-    log.info("Modules: CVE=%s LLM=%s Payloads=ready",
+    log.info("Modules: CVE=%s LLM=%s Payloads=ready Proxy=%s SMTP=%s",
              "ready" if NVD_API_KEY else "ok (no key)",
-             "ready" if LLM.ready() else "not configured")
+             "ready" if LLM.ready() else "not configured",
+             "ready (%d proxies)" % len(PROXY_MANAGER.pool) if PROXY_MANAGER.configured() else "not configured",
+             "ready" if IDENTITY.smtp_configured() else "not configured")
 
     try:
         server.serve_forever()

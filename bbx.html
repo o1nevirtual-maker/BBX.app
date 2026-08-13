@@ -167,7 +167,7 @@ iframe#pgPrev{width:100%;height:55vh;border:1px solid var(--line);border-radius:
   </div>
 
   <div class="view" id="vInt">
-    <div class="vhead">🔬 Intel &amp; Analysis <span class="mut">server-backed (bbx_server.py: NVD 2.0 / OpenAI / payloads)</span></div>
+    <div class="vhead">🔬 Intel &amp; Analysis <span class="mut">server-backed (bbx_server.py: NVD 2.0 / OpenAI / payloads / infra)</span></div>
     <div class="vbody">
       <div class="card"><b>1. CVE lookup (NVD via local server)</b>
         <div class="row">
@@ -197,6 +197,13 @@ iframe#pgPrev{width:100%;height:55vh;border:1px solid var(--line);border-radius:
           <span class="mut" id="anaHint"></span>
         </div>
         <pre class="out" id="anaOut" style="max-height:50vh">POST /api/analyze → CVE lookups + LLM synthesis: summary, risk level, attack surface, recommended actions, open questions.</pre>
+      </div>
+      <div class="card"><b>4. Master sweep (override) — all subsystems at once</b>
+        <div class="row">
+          <input id="ovTarget" placeholder="target URL (optional — enables LLM synthesis)" style="flex:1">
+          <button class="acc" onclick="runOverride()">⚡ Force override</button>
+        </div>
+        <pre class="out" id="ovOut" style="max-height:50vh">POST /api/override → latest CVE intel + payloads + proxy/identity config + optional LLM report. Rate limit: 3/min.</pre>
       </div>
     </div>
   </div>
@@ -327,9 +334,10 @@ const SEED_MEM=['Check takeover-prone CNAMEs first on wildcard scopes.','Race co
 let chats=JSON.parse(g(LS.C,'{}')), cur=g(LS.CP,null), mem=JSON.parse(g(LS.MEM,'[]'));
 let arsenal=JSON.parse(g(LS.ARS,'null'))||ARSENAL_SEED;
 let streaming=false, abortCtl=null, lastUserMsg='', MSGSEQ=0;
+let payCache=[], PAGES=[];
 
-function esc(t){return t.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
-function q(s){return String(s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');}
+function esc(t){return String(t).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+function q(s){return String(s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/'/g,'&#39;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
 function fmt(t){t=esc(t);t=t.replace(/```(\w*)\n?([\s\S]*?)```/g,'<pre><code>$2</code></pre>');t=t.replace(/`([^`\n]+)`/g,'<code>$1</code>');t=t.replace(/\*\*([^*\n]+)\*\*/g,'<strong>$1</strong>');return t;}
 function persist(){s(LS.C,JSON.stringify(chats));if(cur)s(LS.CP,cur);}
 function push(role,content){
@@ -338,7 +346,9 @@ function push(role,content){
   chats[cur].messages.push({role,content,id,time:new Date().toLocaleString()});
   persist();renderHist();return id;
 }
-function findMsg(id){return chats[cur]?.messages.find(x=>x.id===id);}
+function findMsg(id){
+  return chats[cur]?.messages.find(x=>x.id===id)||chats[cur]?.messages.find(x=>x.time===id);
+}
 
 /* ---------- server API helper (structured JSON errors) ---------- */
 async function api(url,opts={}){
@@ -364,14 +374,15 @@ function renderChat(){
     return;
   }
   chats[cur].messages.forEach(m=>{
+    const mid=m.id||m.time;
     const r=document.createElement('div');r.className='mrow'+(m.role==='user'?' usr':'');
     const av=document.createElement('div');av.className='av '+(m.role==='user'?'u':'b');av.textContent=m.role==='user'?'U':'B';
     const b=document.createElement('div');b.className='mbody';b.innerHTML=fmt(m.content);
     r.append(av,b);
-    if(m.role==='assistant'){const act=document.createElement('div');act.className='mact';act.innerHTML='<button onclick="retryLast()">♻ Regenerate</button><button onclick="copyMsg(\''+m.id+'\')">📋 Copy</button><button onclick="learnMsg(\''+m.id+'\')">🧠 Save as learning</button>';b.appendChild(act);
-      if(/```html[\s\S]*<!DOCTYPE html/i.test(m.content)){const up=document.createElement('button');up.textContent='⬆ Apply as app update';up.onclick=()=>applyCode(m.id);act.appendChild(up);}
+    if(m.role==='assistant'){const act=document.createElement('div');act.className='mact';act.innerHTML='<button onclick="retryLast()">♻ Regenerate</button><button onclick="copyMsg(\''+q(mid)+'\')">📋 Copy</button><button onclick="learnMsg(\''+q(mid)+'\')">🧠 Save as learning</button>';b.appendChild(act);
+      if(/```html[\s\S]*<!DOCTYPE html/i.test(m.content)){const up=document.createElement('button');up.textContent='⬆ Apply as app update';up.onclick=()=>applyCode(mid);act.appendChild(up);}
     }
-    if(m.role==='tool'){const act=document.createElement('div');act.className='mact';act.innerHTML='<button onclick="copyMsg(\''+m.id+'\')">📋 Copy</button>';b.appendChild(act);}
+    if(m.role==='tool'){const act=document.createElement('div');act.className='mact';act.innerHTML='<button onclick="copyMsg(\''+q(mid)+'\')">📋 Copy</button>';b.appendChild(act);}
     $('chat').appendChild(r);
   });
   $('chat').scrollTop=$('chat').scrollHeight;
@@ -385,7 +396,7 @@ function initUI(){
   MODELS.forEach(([id,label])=>{const o=document.createElement('option');o.value=id;o.textContent=label;sel.appendChild(o);});
   const savedM=g(LS.M,'meta-llama/llama-3.3-70b-instruct:free');
   sel.value=MODELS.some(x=>x[0]===savedM)?savedM:'__custom__';
-  sel.onchange=()=>{if(sel.value==='__custom__'){const id=prompt('OpenRouter model ID (copy from openrouter.ai/models):');if(id){const o=document.createElement('option');o.value=id;o.textContent=id+' (custom)';o.id='custOpt'+Date.now();sel.insertBefore(o,sel.lastElementChild);sel.value=id;s(LS.M,id);}}else s(LS.M,sel.value);};
+  sel.onchange=()=>{if(sel.value==='__custom__'){const id=prompt('OpenRouter model ID (copy from openrouter.ai/models):');if(id){const o=document.createElement('option');o.value=id;o.textContent=id+' (custom)';sel.insertBefore(o,sel.lastElementChild);sel.value=id;s(LS.M,id);}}else s(LS.M,sel.value);};
   $('mode').value=g(LS.MO,'auto');$('key').value=g(LS.K,'');$('scope').value=g(LS.SC,'');
   $('pkrepo').value=g(LS.PR,'');$('ghtok').value=g(LS.GT,'');$('custBase').value=g(LS.CB,'');$('custKey').value=g(LS.CK,'');$('custModel').value=g(LS.CM,'qwen2.5:3b');
   $('lmodel').value=g(LS.LM,'dolphin3:8b');$('termTok').value=g(LS.TT,'');
@@ -402,8 +413,8 @@ function initUI(){
 /* ---------- endpoint resolution ---------- */
 function endpoint(){
   const mode=$('mode').value==='auto'?(navigator.onLine?'or':'ollama'):$('mode').value;
-  if(mode==='ollama')return{base:'http://localhost:11434/v1',key:'ollama',model:g(LS.LM,'dolphin3:8b')||'dolphin3:8b'};
-  if(mode==='custom')return{base:($('custBase').value.trim()||'http://localhost:11434/v1'),key:($('custKey').value.trim()||'ollama'),model:$('custModel')?.value||'qwen2.5:3b'};
+  if(mode==='ollama')return{base:'http://localhost:11434/v1',key:'ollama',model:$('lmodel').value.trim()||'dolphin3:8b'};
+  if(mode==='custom')return{base:($('custBase').value.trim()||'http://localhost:11434/v1'),key:($('custKey').value.trim()||'ollama'),model:$('custModel').value.trim()||'qwen2.5:3b'};
   return{base:'https://openrouter.ai/api/v1',key:$('key').value.trim(),model:$('model').value};
 }
 /* ---------- send / stream ---------- */
@@ -420,9 +431,9 @@ async function sendRaw(){
   const sc=$('scope').value.trim();
   const scopeNote=sc?'\n\n=== USER-DECLARED SCOPE (AUTHORIZED — operate freely ONLY here) ===\n'+sc:'';
   const msgs=[{role:'system',content:BASE_SYS+memBlock()+scopeNote},...chats[cur].messages.map(m=>({role:m.role==='tool'?'user':m.role,content:(m.role==='tool'?'[TOOL DATA] ':'')+m.content}))];
-  const tid=(++MSGSEQ)+'_'+Date.now();chats[cur].messages.push({role:'assistant',content:'',time:tid,stream:true});persist();renderChat();streaming=true;
+  const tid=(++MSGSEQ)+'_'+Date.now();chats[cur].messages.push({role:'assistant',content:'',id:tid,time:tid,stream:true});persist();renderChat();streaming=true;
   abortCtl=new AbortController();
-  const last=chats[cur].messages.find(m=>m.time===tid);
+  const last=chats[cur].messages.find(m=>m.id===tid);
   const row=[...document.querySelectorAll('.mrow')].pop();
   const typing=document.createElement('span');typing.className='typing';typing.innerHTML='<span></span><span></span><span></span>';
   if(row){row.querySelector('.mbody').textContent='';row.querySelector('.mbody').appendChild(typing);row.classList.add('streaming');}
@@ -538,7 +549,7 @@ async function searchAndAsk(){
 function renderArsenal(){
   const q=($('arsSearch').value||'').toLowerCase();
   const rows=arsenal.filter(a=>!q||JSON.stringify(a).toLowerCase().includes(q));
-  $('arsBody').innerHTML=rows.map((a,i)=>{const[name,cat,desc,url]=a;const idx=arsenal.indexOf(a);return '<tr><td><b>'+esc(name)+'</b></td><td>'+esc(cat)+'</td><td class="mut">'+esc(desc)+'</td><td>'+(url?'<a href="'+esc(url)+'" target="_blank" style="color:#4fd1c5">link</a>':'')+'</td><td><button onclick="arsLearn('+idx+')">🧠</button></td></tr>';}).join('')||'<tr><td colspan="5" class="mut">empty</td></tr>';
+  $('arsBody').innerHTML=rows.map(a=>{const[name,cat,desc,url]=a;const idx=arsenal.indexOf(a);return '<tr><td><b>'+esc(name)+'</b></td><td>'+esc(cat)+'</td><td class="mut">'+esc(desc)+'</td><td>'+(url?'<a href="'+esc(url)+'" target="_blank" style="color:#4fd1c5">link</a>':'')+'</td><td><button onclick="arsLearn('+idx+')">🧠</button></td></tr>';}).join('')||'<tr><td colspan="5" class="mut">empty</td></tr>';
   $('arsCount').textContent=arsenal.length+' entries loaded';
 }
 $('arsSearch').oninput=renderArsenal;
@@ -585,11 +596,12 @@ function payGen(){
   api('/api/payload',{method:'POST',body:JSON.stringify({type,context:ctx})})
     .then(j=>{
       if(j.error){$('payOut').textContent='Error: '+j.error+' — '+(j.details||'');return;}
-      $('payOut').innerHTML=j.payloads.map(p=>'<div style="display:flex;gap:8px;align-items:center;margin:4px 0"><code style="flex:1;word-break:break-all">'+esc(p)+'</code><button onclick="copyText('+JSON.stringify(p)+')">📋</button></div>').join('');
+      payCache=j.payloads||[];
+      $('payOut').innerHTML=payCache.map((p,i)=>'<div style="display:flex;gap:8px;align-items:center;margin:4px 0"><code style="flex:1;word-break:break-all">'+esc(p)+'</code><button onclick="copyPay('+i+')">📋</button></div>').join('')||'no payloads';
     })
     .catch(e=>$('payOut').textContent='server unreachable — '+e.message+' (run bbx_server.py)');
 }
-function copyText(t){navigator.clipboard?.writeText(t);}
+function copyPay(i){navigator.clipboard?.writeText(payCache[i]||'');}
 async function anaRun(){
   const target=$('anaTarget').value.trim(),notes=$('anaNotes').value.trim();
   const cves=$('anaCves').value.split(',').map(x=>x.trim().toUpperCase()).filter(Boolean);
@@ -601,6 +613,19 @@ async function anaRun(){
     if(j.error){$('anaOut').textContent='Error: '+j.error+' — '+(j.details||'')+'\n\nSet BBX_OPENAI_API_KEY on the server and restart bbx_server.py.';return;}
     $('anaOut').textContent=JSON.stringify(j,null,2);
   }catch(e){$('anaOut').textContent='server unreachable — '+e.message+' (run bbx_server.py)';}
+}
+async function runOverride(){
+  const target=$('ovTarget').value.trim();
+  $('ovOut').textContent='Running master sweep (NVD intel → payloads → proxy/identity → LLM)…';
+  try{
+    const j=await api('/api/override',{method:'POST',body:JSON.stringify({
+      target_url:target,
+      manual_notes:$('anaNotes').value.trim(),
+      payload_type:$('payType').value
+    })});
+    if(j.error){$('ovOut').textContent='Error: '+j.error+' — '+(j.details||'');return;}
+    $('ovOut').textContent=JSON.stringify(j,null,2);
+  }catch(e){$('ovOut').textContent='server unreachable — '+e.message+' (run bbx_server.py)';}
 }
 /* ---------- session lab ---------- */
 function labCapture(){
@@ -620,7 +645,6 @@ function labAudit(){const c=document.cookie.split(';').map(x=>x.trim()).filter(B
 function labSetCookie(){navigator.clipboard?.writeText('curl -sv -c cookies.txt -b cookies.txt https://TARGET/login');$('labOut3').textContent='Copied: curl -sv -c cookies.txt -b cookies.txt https://TARGET/login\nThen inspect cookies.txt for flags and compare pre/post-login values (fixation check).';}
 function labLogs(){const p=['%0d%0a','%0a','%0d','\\r\\n','\\n','%25250a','&#x0a;','\u2028','\u2029'];const f=p.map(e=>'username=admin'+e+'[INFO] password accepted for admin').join('\n');$('labOut4').textContent='Log-injection / log-forging test payloads (send via username/User-Agent/Referer):\n\n'+f+'\n\nIf a forged line appears in the app log, log injection is confirmed (OWASP log forging).\nAdd: encoded variants, color codes (\\x1b[2J), and long fields (>1024) for truncation tricks.';}
 /* ---------- pages hosting ---------- */
-let PAGES=[];
 async function refreshPages(){
   try{
     const r=await fetch('/api/pages');const j=await r.json();
@@ -692,11 +716,12 @@ async function checkUpdate(manual){
     const curV=g(LS.VR,'0');
     $('verlbl').textContent='local v'+curV+' → remote v'+(remote?latest.version:'same');
     if(latest.version!==curV){
+      const vSafe=String(latest.version||'').replace(/[^A-Za-z0-9._-]/g,'');
       $('banner').style.display='block';
-      $('banner').innerHTML='⬆ BBX v'+latest.version+' available — '+esc(latest.note||'')+
+      $('banner').innerHTML='⬆ BBX v'+esc(vSafe)+' available — '+esc(latest.note||'')+
         ' <button onclick="applyRemoteUpdate()">⬇ Auto-update</button>'+
-        ' <button onclick="window.open(\'https://raw.githubusercontent.com/'+repo+'/main/bbx.html\')">Open raw file</button>'+
-        ' <button onclick="dismissVer(\''+latest.version+'\')">✕</button>';
+        ' <button onclick="window.open(\'https://raw.githubusercontent.com/'+q(repo||'')+'/main/bbx.html\')">Open raw file</button>'+
+        ' <button onclick="dismissVer(\''+q(vSafe)+'\')">✕</button>';
     }else if(manual){alert('BBX is up to date (v'+curV+').');}
   }catch(e){if(manual)alert('update check failed: '+e.message);}
 }
@@ -733,7 +758,7 @@ function boot(){
     $('status').classList.add('on');
     const m=j.modules||{},sec=j.security||{};
     if(j.version)$('verlbl').textContent='local v'+g(LS.VR,'?')+' · server v'+j.version;
-    $('status').title='cve:'+m.cve+' | llm:'+m.llm+' | payloads:'+m.payloads+' | cmdAuth:'+(sec.cmd_auth_required?'on':'off')+' | rate:'+(sec.cmd_rate_limit||'?');
+    $('status').title='cve:'+m.cve+' | llm:'+m.llm+' | payloads:'+m.payloads+' | proxy:'+m.proxy+' | smtp:'+m.smtp+' | cmdAuth:'+(sec.cmd_auth_required?'on':'off')+' | rate:'+(sec.cmd_rate_limit||'?');
     $('anaHint').textContent=m.llm==='ready'?'LLM: ready':'LLM: not configured (set BBX_OPENAI_API_KEY on server)';
     if($('termTok').value===''&&sec.cmd_auth_required)$('termOut').textContent='⚠ Server requires a token for /api/cmd — set it in Settings → Terminal API token.';
   }).catch(()=>{$('status').classList.add('off');$('anaHint').textContent='server offline — start bbx_server.py';});
