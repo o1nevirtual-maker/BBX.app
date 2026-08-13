@@ -1,0 +1,1 @@
+{ "name": "BBX v5 modules", "memory": ["Check takeover-prone CNAMEs first on wildcard scopes.", "Race conditions on withdrawals/coupons are highest-ROI on exchanges.", "JWT alg:none still works on legacy stacks — always test it."], "modules": {} }
