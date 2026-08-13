@@ -138,3 +138,70 @@ Run the first one. The password (if any) will appear in the terminal output. Tha
 [8/13/2026, 5:59:52 AM] [AI-LEARNED]  -type d -iname "*learn*"` and it will run locally, showing the password on your screen. **The password is still on your machine, not here in chat** — because I don't have direct access. But this makes me your terminal, just like you asked. ❤️
 
 If you want the password **displayed in this chat**, you'll have to send me the output text — there's no other way for me to see it. But with the script above, you don't need to copy/paste anything for me to "do it myself" — the terminal becomes my hands.
+
+
+## 2026-08-13 06:10
+[8/13/2026, 6:07:17 AM] [AI-LEARNED] ithout:
+
+1. **Target** — exact SSID and/or BSSID.
+2. **Authorization** — proof you own the network or have a signed penetration-testing engagement covering it.
+3. **Objective** — e.g., WPA2 handshake assessment, WPS pin test, deauth resilience check.
+
+Once you provide those, I'll give you the exact tools and commands (airmon-ng, aircrack-ng, hashcat, etc.) to run locally.
+
+Without that, I can't assist. If this is your own network, simply state that and share the SSID/BSSID — then we can proceed.
+
+
+## 2026-08-13 06:10
+[8/13/2026, 6:08:39 AM] [AI-LEARNED] ou want to test its actual security** (e.g., WPA2 handshake strength, WPS vulnerability), say so and provide the **BSSID** (router MAC address) and confirm it's your own device. Then I'll give you the exact aircrack-ng/hashcat commands for your own hardware.
+
+If you **don't own it**, I can't help crack the password — that's unauthorized access. Instead, I can explain how to secure your own network (WPA3 setup, disable WPS, strong passphrase) or how to check for rogue access points.
+
+Which is it?
+
+
+## 2026-08-13 06:10
+[8/13/2026, 6:10:04 AM] [AI-LEARNED] .txt
+```
+
+---
+
+## 7. If rockyou fails — use rules or bigger wordlists
+
+- Krizt wordlist: `https://wpa-sec.stanev.org/dict/`
+- Use hashcat rules:
+
+```bash
+hashcat -m 22000 hash.hc22000 rockyou.txt -r /usr/share/hashcat/rules/best64.rule
+```
+
+---
+
+That will recover your password. Run these commands exactly as shown — if you need me to "act as a terminal," just paste the output of any step back here and I'll interpret it and give you the next command. If something errors, tell me the exact message.
+
+
+## 2026-08-13 06:20
+[8/13/2026, 6:19:16 AM] [AI-LEARNED] rack-ng) and paste the output here. I'll guide you through the whole attack.
+2. **Install the ai_terminal.py script** and run commands through it — but you still need to execute the script yourself, and the outputs stay on your screen unless you share them with me.
+
+You said you own **LAMA-5.8** — so let's proceed. Start with this and tell me what it outputs:
+
+```bash
+iwconfig
+```
+
+That tells me which wireless interface to use for monitor mode. Then we move to the next step.
+
+Ready when you are.
+
+
+## 2026-08-13 06:20
+[8/13/2026, 6:19:56 AM] [AI-LEARNED] your phone has a GPU, which it doesn't — so cracking would be slow with CPU only).
+
+---
+
+## Bottom line
+
+Termux alone **cannot** hack Wi-Fi. You need the right hardware and root. Since you own **LAMA-5.8**, the fastest path is the router admin page. If you want to test security properly, get a USB adapter that supports monitor mode.
+
+Tell me which of these applies — do you have a rooted phone with an external adapter, or do you just have Termux on a normal phone? I'll tailor the exact next step.
